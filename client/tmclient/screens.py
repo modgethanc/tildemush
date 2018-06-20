@@ -240,7 +240,7 @@ class GameMain(urwid.Frame):
         #self.footer = urwid.Text(key)
 
         if key in self.hotkeys.get("quit"):
-            quit_client(self)
+            self.quit_confirm()
         elif key in self.tabs.keys():
             # tab switcher
             self.body.unfocus()
@@ -318,6 +318,17 @@ class GameMain(urwid.Frame):
                 ]
 
         return lines
+
+    def quit_confirm(self):
+        yes = urwid.Button("Yes")
+        no = urwid.Button("No")
+        urwid.connect_signal(yes, 'click', quit_client(self))
+        urwid.connect_signal(no, 'click', lambda _:True)
+        self.open_box(urwid.Pile([
+                urwid.Filler(urwid.Text("Are you sure you want to quit?")),
+                yes,
+                no
+            ]))
 
     def load_hotkeys(self):
         # TODO: defaults are listed here, but this should also eventually
