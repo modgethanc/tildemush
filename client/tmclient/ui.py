@@ -18,6 +18,12 @@ palettes = [
     # standard colors - only using foreground colors, eventually
     # we could probably do permutations of fg/bg combinations
     # the names come from http://urwid.org/manual/displayattributes.html
+    ('red', 'light red', ''),
+    ('green', 'light green', ''),
+    ('blue', 'light blue', ''),
+    ('magenta', 'light magenta', ''),
+    ('cyan', 'light cyan', ''),
+    ('gray', 'light gray', ''),
     ('dark red', 'dark red', ''),
     ('dark green', 'dark green', ''),
     ('brown', 'brown', ''),
@@ -36,6 +42,12 @@ palettes = [
     ('black', 'black', 'white'),
     ('/', 'white', ''),
     ('reset', 'white', '')]
+
+KEY_ESCAPE_MAP = {
+    key: urwid.vterm.ESC + sequence
+      for sequence, key in urwid.escape.input_sequences
+      if len(key) > 1
+}
 
 
 class Form(urwid.Pile):
@@ -88,6 +100,12 @@ class DashedBox(urwid.LineBox):
                 tlcorner='┌', tline='╌', lline='╎', trcorner='┐', blcorner='└',
                 rline='╎', bline='╌', brcorner='┘'
                 )
+
+class SpookyBox(urwid.LineBox):
+    def __init__(self, box_item):
+        super().__init__(box_item,
+                tline='~', bline='~', lline='┆', rline='┆', tlcorner='o',
+                trcorner='o', blcorner='o', brcorner='o')
 
 class TabHeader(urwid.LineBox):
     """
@@ -209,6 +227,11 @@ class GameTab(urwid.WidgetPlaceholder):
         self.in_focus = False
         self.tab_header = TabHeader(self.tab_header.label, self.tab_header.position, False)
 
+    def mount(self, widget):
+        self.original_widget = urwid.LineBox(widget, tlcorner='│', trcorner='│', tline='')
+        self.prompt = widget
+
+
 
 class ColorText(urwid.Text):
     """
@@ -223,7 +246,8 @@ class ColorText(urwid.Text):
         theme = ""
         for token in parts:
             if token[1] != '':
-                res.append((theme, text))
+                if text != '':
+                    res.append((theme, text))
                 theme = token[1][1:-1]
                 text = ''
             elif token[0] == "\{":
@@ -232,6 +256,90 @@ class ColorText(urwid.Text):
                 text += token[0]
         res.append((theme, text))
         super().__init__(res, align, wrap, layout)
+
+class WitchView(GameTab):
+
+    def __init__(self, object_data):
+        self.info = {
+                "edit area": "NO OBJECT LOADED! /edit an object in the game view to work on it here",
+                "data": "Current Object: <None>",
+                "perms": "Permissions: <unknown>",
+                "status": "WITCH STATUS: <unknown>"
+                }
+
+        self.editor_filler = ColorText(self.info.get("edit area"), align='center')
+        self.editor = urwid.Filler(self.editor_filler)
+        self.editor_box = SpookyBox(self.editor)
+        self.status = ColorText(self.info.get("status"))
+        self.data = urwid.Filler(ColorText(self.info.get("data")))
+        self.perms = urwid.Filler(ColorText(self.info.get("perms")))
+        self.body = urwid.Pile([
+                urwid.Columns([
+                    self.data,
+                    self.perms
+                ]),
+                self.editor_box
+            ])
+        self.prompt = self.editor
+        self.view = urwid.Frame(body=self.body, footer=self.status)
+        self.view.focus_position = 'body'
+        super().__init__(self.view, TabHeader("F2 WITCH"), self.prompt)
+
+
+
+class ExternalEditor(urwid.Terminal):
+    def __init__(self, path, loop, callback):
+        self.terminated = False
+        self.path = path
+        self.callback = callback
+        command = ["bash", "-c", "{} {}; echo Press any key to kill this window...".format(
+            os.environ["EDITOR"], self.path)]
+        super(ExternalEditor, self).__init__(command, os.environ, loop, "ctrl z")
+        urwid.connect_signal(self, "closed", self.exterminate)
+
+    def exterminate(self, *_):
+        if self.callback:
+            self.callback(self.path)
+
+    def keypress(self, size, key):
+        """
+        The majority of the things the parent keypress method will do is
+        either erroneous or disruptive to my own usage. I've plucked out
+        the necessary bits and, most importantly, have changed from
+        ASCII encoding to utf8 when writing to the child process.
+        """
+
+        #print("("+key+")")
+        if self.terminated:
+            return
+
+        self.term.scroll_buffer(reset=True)
+        keyl = key.lower()
+
+        if keyl == "ctrl z":
+            return os.killpg(os.getpgid(os.getpid()), 19)
+
+        single_char = len(key) == 6
+        if key.startswith("ctrl ") and single_char:
+            if key[-1].islower():
+                key = chr(ord(key[-1]) - ord("a") + 1)
+            else:
+                key = chr(ord(key[-1]) - ord("A") + 1)
+
+        elif key.startswith("meta ") and single_char:
+            key = urwid.vterm.ESC + key[-1]
+
+        elif key in urwid.vterm.KEY_TRANSLATIONS:
+            key = urwid.vterm.KEY_TRANSLATIONS[key]
+        
+        elif key in KEY_ESCAPE_MAP:
+            key = KEY_ESCAPE_MAP[key]
+
+
+        if self.term_modes.lfnl and key == "\x0d":
+            key += "\x0a"
+
+        os.write(self.master, key.encode("utf8"))
 
 
 class UI:

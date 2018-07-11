@@ -8,6 +8,51 @@ from ..world import GameWorld
 
 from .tm_test_case import TildemushTestCase
 
+class FuzzyMatchTest(TildemushTestCase):
+    def setUp(self):
+        super().setUp()
+        self.vil = UserAccount.create(
+            username='vilmibm',
+            password='foobarbazquux')
+
+        self.phaser = GameObject.create_scripted_object(
+            self.vil, 'phaser-vilmibm-666', 'item', dict(
+                name='Federation Phaser',
+                description='Looks like a remote control, but is far deadlier. You should probably leave it set for stun.'))
+
+    def test_ignores_color_codes(self):
+        rainbow = GameObject.create_scripted_object(
+            self.vil, 'contrived-example-vilmibm', 'item', dict(
+                name='a {red}r{orange}a{yellow}i{green}n{blue}b{indigo}o{violet}w{/}',
+                description="all the way across the sky."))
+        assert rainbow.fuzzy_match('rainbow')
+
+    def test_exact_name_match(self):
+        assert self.phaser.fuzzy_match('Federation Phaser')
+        assert self.phaser.fuzzy_match('federation phaser')
+
+    def test_exact_shortname_match(self):
+        assert self.phaser.fuzzy_match('phaser-vilmibm-666')
+        assert self.phaser.fuzzy_match('pHaSeR-ViLmIbM-666')
+
+    def test_fuzzy_name_match(self):
+        assert self.phaser.fuzzy_match('federation')
+        assert self.phaser.fuzzy_match('Federation')
+
+    def test_fuzzy_shortname_match(self):
+        assert self.phaser.fuzzy_match('phaser-vil')
+        assert self.phaser.fuzzy_match('pHasEr-vIl')
+
+    def test_substr_name_match(self):
+        # yeah this is contrived sorry
+        assert self.phaser.fuzzy_match('ederation phase')
+        assert self.phaser.fuzzy_match('edErAtIoN pHase')
+
+    def test_substr_shortname_match(self):
+        assert self.phaser.fuzzy_match('ser-vil')
+        assert self.phaser.fuzzy_match('sEr-vIl')
+
+
 class CreateScriptedObjectTest(TildemushTestCase):
     def setUp(self):
         super().setUp()
@@ -17,7 +62,7 @@ class CreateScriptedObjectTest(TildemushTestCase):
 
     def test_data_initialized(self):
         banana = GameObject.create_scripted_object(
-            'item', self.vil, 'banana-vilmibm', dict(
+            self.vil, 'banana-vilmibm', 'item', dict(
                 name='A Banana',
                 description='Still green.'))
         assert banana.data == dict(
@@ -43,13 +88,6 @@ class GameObjectDataTest(TildemushTestCase):
         with mock.patch('tmserver.models.GameObject.save') as save_m:
             self.snoozy._ensure_data({})
 
-        assert not save_m.called
-
-    def test_ensure_data_ignores_populated_data_mapping(self):
-        self.snoozy.data = {'stuff': 'here'}
-        self.snoozy.save()
-        with mock.patch('tmserver.models.GameObject.save') as save_m:
-            self.snoozy._ensure_data({'aw':'yis'})
         assert not save_m.called
 
     def test_ensure_data(self):
@@ -78,52 +116,59 @@ class GameObjectDataTest(TildemushTestCase):
         self.snoozy.set_data('num_pets', self.snoozy.get_data('num_pets') + 1)
         assert 1 == GameObject.get_by_id(self.snoozy.id).get_data('num_pets')
 
+    def test_handles_new_default_keys(self):
+        some_data = {
+            'smoked': False,
+            'length': 4
+        }
+        self.snoozy._ensure_data(some_data)
+        assert False == self.snoozy.get_data('smoked')
+        assert 4 == self.snoozy.get_data('length')
+        new_data = {
+            'smoked': True,
+            'length': 20,
+            'wrapper': 'brown',
+        }
+        self.snoozy._ensure_data(new_data)
+        assert False == self.snoozy.get_data('smoked')
+        assert 4 == self.snoozy.get_data('length')
+        assert 'brown' == self.snoozy.get_data('wrapper')
 
-def GameObjectComparisonTest(self):
 
+class GameObjectComparisonTest(TildemushTestCase):
     def setUp(self):
         super().setUp()
         self.vil = UserAccount.create(
             username='vilmibm',
             password='foobarbazquux')
-        self.snoozy = GameObject.create(
+        self.snoozy = GameObject.create_scripted_object(
             author=self.vil,
-            shortname='snoozy')
-
-        self.horse_script = Script.create(author=self.vil)
-        self.revision = ScriptRevision.create(code='<witch code>', script=self.horse_script)
+            shortname='snoozy',
+            format_dict=dict(
+                name='snoozy',
+                description='a horse'))
 
     def test_str_representation(self):
-        assert 'GameObject<snoozy> authored by {}'.format(self.vil) == str(self.snoozy)
-
-    def test_eq_operations_without_revisions(self):
-        snoozy = GameObject.get_by_id(self.snoozy.id)
-        assert True == (snoozy == self.snoozy)
-
-        snoozy.shortname = 'false-snoozy'
-        assert False == (snoozy == self.snoozy)
+        assert 'GameObject<snoozy>'.format(self.vil) == repr(self.snoozy)
+        assert 'snoozy'.format(self.vil) == str(self.snoozy)
 
     def test_eq_operations(self):
-        self.snoozy.script_revision = self.revision
-        self.snoozy.save()
         snoozy = GameObject.get_by_id(self.snoozy.id)
-        assert True == (snoozy == self.snoozy)
+        assert snoozy == self.snoozy
 
-        revision = ScriptRevision.create(code='(witch)', script=self.snoozy.script)
+        revision = ScriptRevision.create(code='(witch)', script=self.snoozy.script_revision.script)
         snoozy = GameObject.get_by_id(self.snoozy.id)
         snoozy.script_revision = revision
-        assert True == (snoozy != self.snoozy)
+        assert snoozy != self.snoozy
 
     def test_hash_operations(self):
-        self.snoozy.script_revision = self.revision
-        self.snoozy.save()
         snoozy = GameObject.get_by_id(self.snoozy.id)
-        assert True == (snoozy.__hash__() == self.snoozy.__hash__())
+        assert snoozy.__hash__() == self.snoozy.__hash__()
 
-        revision = ScriptRevision.create(code='(witch)', script=self.snoozy.script)
+        revision = ScriptRevision.create(code='(witch)', script=self.snoozy.script_revision.script)
         snoozy = GameObject.get_by_id(self.snoozy.id)
         snoozy.script_revision = revision
-        assert False == (snoozy.__hash__() == self.snoozy.__hash__())
+        assert snoozy.__hash__() != self.snoozy.__hash__()
 
 
 class GameObjectScriptEngineTest(TildemushTestCase):

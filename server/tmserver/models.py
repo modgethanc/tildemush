@@ -9,13 +9,14 @@ from playhouse.postgres_ext import JSONField
 from . import config
 from .errors import UserValidationError, ClientException
 from .scripting import ScriptedObjectMixin
+from .util import strip_color_codes, collapse_whitespace
 
 
 BAD_USERNAME_CHARS_RE = re.compile(r'[\:\'";%]')
 MIN_PASSWORD_LEN = 12
 
 class BaseModel(Model):
-    created_at = pw.DateTimeField(default=datetime.utcnow())
+    created_at = pw.DateTimeField(default=datetime.utcnow)
     class Meta:
         database = config.get_db()
 
@@ -85,16 +86,18 @@ def on_user_account_create(cls, instance, created):
 
     with config.get_db().atomic():
         player = GameObject.create_scripted_object(
-            'player', instance, instance.username,
+            instance, instance.username, 'player',
             {'name': instance.username,
             'description': 'a gaseous cloud'})
         player.is_player_obj = True
         player.save()
         sanctum = GameObject.create_scripted_object(
-            'room', instance,
-            '{}-sanctum'.format(instance.username),
-            {'name': "{}'s Sanctum".format(instance.username),
-             'description': "This is your private space. Only you (and gods) can enter here. Any new rooms you create will be attached to this hub. You are free to store items here for safekeeping that you don't want to carry around."})
+            instance, '{}-sanctum'.format(instance.username), 'room',
+            dict(name="{}'s Sanctum".format(instance.username),
+                 description="""This is your private space. Only you (and gods)
+                 can enter here. Any new rooms you create will be attached to
+                 this hub. You are free to store items here for safekeeping
+                 that you don't want to carry around."""))
         sanctum.is_sanctum=True,
         sanctum.save()
 
@@ -137,9 +140,20 @@ class Permission(BaseModel):
     carry = pw.IntegerField(default=WORLD)
     execute = pw.IntegerField(default=WORLD)
 
+    def _enum_to_str(self, perm):
+        return 'world' if perm == self.WORLD else 'owner'
+
+    def as_dict(self):
+        return dict(
+            read=self._enum_to_str(self.read),
+            write=self._enum_to_str(self.write),
+            carry=self._enum_to_str(self.carry),
+            execute=self._enum_to_str(self.execute))
+
 
 class GameObject(BaseModel, ScriptedObjectMixin):
     author = pw.ForeignKeyField(UserAccount)
+    # TODO index?
     shortname = pw.CharField(null=False, unique=True)
     script_revision = pw.ForeignKeyField(ScriptRevision, null=True)
     is_player_obj = pw.BooleanField(default=False)
@@ -148,13 +162,20 @@ class GameObject(BaseModel, ScriptedObjectMixin):
     perms = pw.ForeignKeyField(Permission, backref='obj', null=True)
 
     @classmethod
-    def create_scripted_object(cls, obj_type, author, shortname, format_dict=None):
+    def create_scripted_object(cls, author, shortname, obj_type='item', format_dict=None):
         """This function does the necessary shenanigans to create a
         script/scriptrev/obj. It creates them all in the DB and returns the
         GameObject."""
 
         if format_dict is None:
-            format_dict = {}
+            format_dict = {
+                'name': 'an object',
+                'description': 'a perfect gray sphere'
+            }
+
+        if 'description' in format_dict:
+            format_dict['description'] = collapse_whitespace(format_dict['description'])
+
         script_code = cls.get_template(obj_type).format(**format_dict)
         with config.get_db().atomic():
             script = Script.create(
@@ -198,6 +219,69 @@ class GameObject(BaseModel, ScriptedObjectMixin):
         if self.is_player_obj:
             return self.author
         return None
+
+    @property
+    def latest_script_rev(self):
+        # TODO this barfs for objects without script revisions. ultimately
+        # objects probably shouldn't lack script revisions so i'll let it blow
+        # up as a reminder.
+        current_rev = self.script_revision
+        return ScriptRevision\
+            .select()\
+            .where(ScriptRevision.script==current_rev.script)\
+            .order_by(ScriptRevision.created_at.desc())\
+            .limit(1)[0]
+
+    def set_perm(self, perm, setting):
+        """Given a perm defined in Permission and either 'owner' or 'world',
+        sets and saves the permission on the game object."""
+        if not hasattr(self.perms, perm):
+            raise ValueError('Invalid permission {}'.format(perm))
+        if not hasattr(self.perms, setting.upper()):
+            raise ValueError('Invalid permission mode {}'.format(setting))
+
+        setattr(self.perms, perm, getattr(self.perms, setting.upper()))
+        self.perms.save()
+
+    def set_perms(self, **kwargs):
+        for k,v in kwargs.items():
+            self.set_perm(k, v)
+
+    def fuzzy_match(self, match_string):
+        """Given a string, return whether or not it could be considered as
+        referencing this object. Roughly, this means:
+
+        - is it an exact match on shortname?
+        - is it an exact match on name?
+        - is it a prefix for name?
+        - is it a prefix for shortname?
+        - does it appear as a substring in name?
+        - does it appear as a substring in shortname?
+
+        In all cases, case is ignored.
+        """
+        shortname = self.shortname.lower()
+        name = strip_color_codes(self.name.lower())
+        match_string = match_string.lower()
+        if match_string == shortname:
+            return True
+
+        if match_string == name:
+            return True
+
+        if name.startswith(match_string):
+            return True
+
+        if shortname.startswith(match_string):
+            return True
+
+        if match_string in name:
+            return True
+
+        if match_string in shortname:
+            return True
+
+        return False
 
     def can_carry(self, target_obj):
         return self._can_perm('carry', target_obj)
@@ -250,6 +334,9 @@ def on_game_object_create(cls, instance, created):
     instance.perms = Permission.create()
     instance.save()
 
+class Editing(BaseModel):
+    user_account = pw.ForeignKeyField(UserAccount)
+    game_obj = pw.ForeignKeyField(GameObject)
 
 class Contains(BaseModel):
     outer_obj = pw.ForeignKeyField(GameObject)
@@ -262,4 +349,4 @@ class Log(BaseModel):
     raw = pw.CharField()
 
 
-MODELS = [UserAccount, Log, GameObject, Contains, Script, ScriptRevision, Permission]
+MODELS = [UserAccount, Log, GameObject, Contains, Script, ScriptRevision, Permission, Editing]
