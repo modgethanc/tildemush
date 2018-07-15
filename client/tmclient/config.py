@@ -13,6 +13,7 @@ def ensure_config_file(path):
     if not os.path.isfile(path):
         with open(path, 'w') as config_file:
             config_file.write("{}")
+    os.chmod(path, 0o600)
 
 class Config:
     def __init__(self, path=DEFAULT_CONFIG_PATH):
