@@ -283,13 +283,24 @@ class GameMain(urwid.Frame):
     def quit_confirm(self):
         yes = urwid.Button("Yes")
         no = urwid.Button("No")
-        urwid.connect_signal(yes, 'click', quit_client(self))
-        urwid.connect_signal(no, 'click', lambda _:True)
-        self.open_box(urwid.Pile([
-                urwid.Filler(urwid.Text("Are you sure you want to quit?")),
-                yes,
-                no
-            ]))
+
+        quit_box = urwid.LineBox(
+                    urwid.Pile([
+                    urwid.Filler(urwid.Text("Are you sure you want to quit?")),
+                    yes,
+                    no
+                    ]))
+
+        self.ui_loop.widget = urwid.Overlay(
+                quit_box,
+                self.ui_loop.widget,
+                align=('relative', 50),
+                valign=('relative', 50),
+                width=('relative', 80),
+                height=('relative', 80)
+                )
+        #urwid.connect_signal(yes, 'click', quit_client(self))
+        #urwid.connect_signal(no, 'click', lambda _:True)
 
     def load_hotkeys(self):
         defaults = {
