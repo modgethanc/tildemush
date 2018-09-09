@@ -1,7 +1,7 @@
 import types
 from unittest import mock
 from .. import models
-from ..errors import WitchException
+from ..errors import WitchError
 from ..models import UserAccount, GameObject, Contains, Script, ScriptRevision
 from ..scripting import ScriptEngine
 from ..world import GameWorld
@@ -213,13 +213,13 @@ class GameObjectScriptEngineTest(TildemushTestCase):
         assert type(self.snoozy.engine.handler(GameWorld, 'pet')) == types.FunctionType
 
     def test_handler_works(self):
-        self.snoozy.handle_action(GameWorld, self.vil, 'pet', [])
+        self.snoozy.handle_action(GameWorld, self.vil, 'pet', '')
         assert self.snoozy.get_data('num-pets') == 1
-        self.snoozy.handle_action(GameWorld, self.vil, 'pet', [])
-        self.snoozy.handle_action(GameWorld, self.vil, 'pet', [])
-        self.snoozy.handle_action(GameWorld, self.vil, 'pet', [])
+        self.snoozy.handle_action(GameWorld, self.vil, 'pet', '')
+        self.snoozy.handle_action(GameWorld, self.vil, 'pet', '')
+        self.snoozy.handle_action(GameWorld, self.vil, 'pet', '')
         with mock.patch('tmserver.models.GameObject.say') as mock_say:
-            self.snoozy.handle_action(GameWorld, self.vil, 'pet', [])
+            self.snoozy.handle_action(GameWorld, self.vil, 'pet', '')
             mock_say.assert_called_once_with('neigh neigh neigh i am horse')
 
     def test_debug_handler(self):
@@ -229,7 +229,7 @@ class GameObjectScriptEngineTest(TildemushTestCase):
     def test_bad_witch(self):
         self.script_rev.code = '''(witch)'''
         self.script_rev.save()
-        with self.assertRaises(WitchException):
+        with self.assertRaises(WitchError):
             self.snoozy.handle_action(GameWorld, self.vil, 'pet', [])
 
     def test_unhandled_action(self):
@@ -237,5 +237,3 @@ class GameObjectScriptEngineTest(TildemushTestCase):
         with mock.patch('tmserver.scripting.ScriptEngine.noop') as mock_noop:
             self.snoozy.handle_action(GameWorld, 'poke', self.vil, [])
             assert mock_noop.called
-
-

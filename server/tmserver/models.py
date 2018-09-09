@@ -1,4 +1,5 @@
 from datetime import datetime
+import itertools
 import re
 
 import bcrypt
@@ -7,7 +8,7 @@ from playhouse.signals import Model, pre_save, post_save
 from playhouse.postgres_ext import JSONField
 
 from . import config
-from .errors import UserValidationError, ClientException
+from .errors import UserValidationError, ClientError
 from .scripting import ScriptedObjectMixin
 from .util import strip_color_codes, collapse_whitespace
 
@@ -92,7 +93,7 @@ def on_user_account_create(cls, instance, created):
         player.is_player_obj = True
         player.save()
         sanctum = GameObject.create_scripted_object(
-            instance, '{}-sanctum'.format(instance.username), 'room',
+            instance, '{}/sanctum'.format(instance.username), 'room',
             dict(name="{}'s Sanctum".format(instance.username),
                  description="""This is your private space. Only you (and gods)
                  can enter here. Any new rooms you create will be attached to
@@ -132,6 +133,9 @@ class Permission(BaseModel):
 
     W+R O+W W+C W+C
     """
+    PERMISSIONS = ['read', 'write', 'carry', 'execute']
+    VALUES = ['owner', 'world']
+
     OWNER = 1
     WORLD = 2
 
@@ -140,8 +144,17 @@ class Permission(BaseModel):
     carry = pw.IntegerField(default=WORLD)
     execute = pw.IntegerField(default=WORLD)
 
-    def _enum_to_str(self, perm):
-        return 'world' if perm == self.WORLD else 'owner'
+    @classmethod
+    def valid_perm(cls, perm):
+        return perm in cls.PERMISSIONS
+
+    @classmethod
+    def valid_value(cls, value):
+        return value in cls.VALUES
+
+    @classmethod
+    def _enum_to_str(cls, perm):
+        return 'world' if perm == cls.WORLD else 'owner'
 
     def as_dict(self):
         return dict(
@@ -207,12 +220,26 @@ class GameObject(BaseModel, ScriptedObjectMixin):
 
     @property
     def contained_by(self):
+        """Returns a generator of all the objects that contain the calling
+        object."""
+        return (c.outer_obj for c in Contains.select().where(Contains.inner_obj==self))
+
+    @property
+    def neighbors(self):
+        """Returns generator of the objects contained by this object's container."""
+        return itertools.chain(*[o.contains for o in self.contained_by])
+
+    @property
+    def room(self):
+        """Unlike contained_by, this method either returns the single thing
+        that contains the calling obj or raises."""
         model_set = list(Contains.select().where(Contains.inner_obj==self))
         if not model_set:
             return None
         if len(model_set) > 1:
-            raise ClientException("Bad state: contained by multiple things.")
+            raise ClientError("Bad state: room() called but obj contained by multiple things.")
         return model_set[0].outer_obj
+
 
     @property
     def user_account(self):
@@ -338,10 +365,15 @@ class Editing(BaseModel):
     user_account = pw.ForeignKeyField(UserAccount)
     game_obj = pw.ForeignKeyField(GameObject)
 
+
 class Contains(BaseModel):
     outer_obj = pw.ForeignKeyField(GameObject)
     inner_obj = pw.ForeignKeyField(GameObject)
 
+
+class LastSeen(BaseModel):
+    user_account = pw.ForeignKeyField(UserAccount)
+    room = pw.ForeignKeyField(GameObject)
 
 class Log(BaseModel):
     env = pw.CharField()
@@ -349,4 +381,4 @@ class Log(BaseModel):
     raw = pw.CharField()
 
 
-MODELS = [UserAccount, Log, GameObject, Contains, Script, ScriptRevision, Permission, Editing]
+MODELS = [UserAccount, Log, GameObject, Contains, Script, ScriptRevision, Permission, Editing, LastSeen]

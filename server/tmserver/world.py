@@ -4,25 +4,19 @@ import re
 from slugify import slugify
 
 from .config import get_db
-from .errors import RevisionException, WitchException, ClientException
-from .models import Contains, GameObject, Script, ScriptRevision, Permission, Editing
+from .constants import DIRECTIONS, REVERSE_DIRS
+from .errors import RevisionError, WitchError, ClientError, UserError
+from .mapping import render_map
+from .models import Contains, GameObject, Script, ScriptRevision, Permission, Editing, LastSeen
 from .util import strip_color_codes, split_args, ARG_RE
 
 OBJECT_DENIED = 'You grab a hold of {} but no matter how hard you pull it stays rooted in place.'
 OBJECT_NOT_FOUND = 'You look in vain for {}.'
-DIRECTIONS = {'north', 'south', 'west', 'east', 'above', 'below'}
 CREATE_TYPES = {'room', 'exit', 'item'}
 CREATE_RE = re.compile(r'^([^ ]+) "([^"]+)" (.*)$')
 CREATE_EXIT_ARGS_RE = re.compile(r'^([^ ]+) ([^ ]+) (.*)$')
 PUT_ARGS_RE = re.compile(r'^(.+) in (.+)$')
 REMOVE_ARGS_RE = re.compile(r'^(.+) from (.+)$')
-REVERSE_DIRS = {
-    'north': 'south',
-    'south': 'north',
-    'east': 'west',
-    'west': 'east',
-    'above': 'below',
-    'below': 'above'}
 SPECIAL_HANDLING = {'say'} # TODO i thought there were others but for now it's just say. might not need a set in the end.
 
 
@@ -36,14 +30,45 @@ class GameWorld:
 
     @classmethod
     def register_session(cls, user_account, user_session):
-        # TODO check for this key already existing
+        if user_account.id in cls._sessions:
+            raise ClientError('User {} already logged in.'.format(user_account))
+
         cls._sessions[user_account.id] = user_session
+
+        player_obj = user_account.player_obj
+        ls = LastSeen.get_or_none(user_account=user_account)
+        room = None
+        if ls is None:
+            room = GameObject.get(GameObject.shortname=='god/foyer')
+        else:
+            room = ls.room
+        cls.put_into(room, player_obj)
+        LastSeen.delete().where(LastSeen.user_account==user_account).execute()
+        affected = (o for o in room.contains if o.is_player_obj and o != player_obj)
+        for o in affected:
+            cls.user_hears(o, player_obj, '{} fades in.'.format(player_obj.name))
+
+    @classmethod
+    def unregister_session(cls, user_account):
+        if user_account.id in cls._sessions:
+            del cls._sessions[user_account.id]
+
+        Editing.delete().where(Editing.user_account==user_account).execute()
+        player_obj = user_account.player_obj
+        room = player_obj.room
+        if room is not None:
+            cls.remove_from(player_obj.room, player_obj)
+            affected = (o for o in room.contains if o.is_player_obj)
+            for o in affected:
+                cls.user_hears(o, player_obj, '{} fades out.'.format(player_obj.name))
+
+            LastSeen.create(user_account=user_account, room=room)
 
     @classmethod
     def get_session(cls, user_account_id):
         session = cls._sessions.get(user_account_id)
         if session is None:
-            raise ClientException('No session found. Log in again.')
+            raise ClientError('No session found. Log in again.')
 
         return session
 
@@ -52,29 +77,21 @@ class GameWorld:
         """Given a user account, returns a dictionary of information relevant
         to the game client."""
         player_obj = user_account.player_obj
-        room = player_obj.contained_by
-        exits = room.get_data('exits', {})
+        room = player_obj.room
+
+        exits = [o for o in room.contains if o.get_data('exit')]
         exit_payload = {}
+        for e in exits:
+            route = e.get_data('exit', {}).get(room.shortname)
+            if route is None: continue
 
-        for direction in DIRECTIONS:
-            if direction not in exits:
-                continue
+            target_room_shortname = route[1]
+            target_room = GameObject.get_or_none(GameObject.shortname==target_room_shortname)
+            if target_room is None: continue
 
-            exit_obj = GameObject.get_or_none(GameObject.shortname==exits[direction])
-            if exit_obj is None:
-                continue
-
-            target_room_name = exit_obj.get_data('target')
-            if target_room_name is None:
-                continue
-
-            target_room = GameObject.get_or_none(GameObject.shortname==target_room_name)
-            if target_room is None:
-                continue
-
-            exit_payload[direction] = dict(
-                exit_name=exit_obj.name,
-                room_name=target_room.name)
+            exit_payload[route[0]] = {
+                'exit_name': e.name,
+                'room_name': target_room.name}
 
         return {
             'motd': 'welcome to tildemush',  # TODO
@@ -122,6 +139,8 @@ class GameWorld:
         # listens for like "pet"). I'm considering generalizing this as a list
         # of GAME_COMMANDS that map to a GameWorld handle_* method.
 
+        # TODO add destroy action
+
         # admin
         if action == 'announce':
             cls.handle_announce(sender_obj, action_args)
@@ -129,37 +148,26 @@ class GameWorld:
         # chatting
         elif action == 'whisper':
             cls.handle_whisper(sender_obj, action_args)
-
         elif action == 'look':
             cls.handle_look(sender_obj, action_args)
 
         # scripting
         elif action == 'create':
             cls.handle_create(sender_obj, action_args)
-
         elif action == 'edit':
             cls.handle_edit(sender_obj, action_args)
             return
-
-        # TODO teleport, either 'home' or 'foyer'
+        elif action == 'mode':
+            cls.handle_mode(sender_obj, action_args)
 
         # movement
-        elif action == 'move':
-            # TODO
-            # an unintentional side effect of the exits/rooms implementation
-            # was exposing a /move command. this lets any user teleport to any
-            # shortname, including (at the moment) sanctums.
-            #
-            # there are a few options:
-            # - keep this code here exactly the same, but block /move in core.py
-            # - change tell-sender to be move-sender and don't go through dispatch_action
-            # - keep this code here exactly the same, but block moving to
-            #   places you aren't allowed to be in in handle_move
-            cls.handle_move(sender_obj, action_args)
-            return
         elif action == 'go':
             cls.handle_go(sender_obj, action_args)
             return
+        elif action == 'home':
+            cls.move_obj(sender_obj, '{}/sanctum'.format(sender_obj.user_account.username))
+        elif action == 'foyer':
+            cls.move_obj(sender_obj, 'god/foyer')
 
         # inventory commands
         elif action == 'get':
@@ -207,6 +215,24 @@ class GameWorld:
         return None
 
     @classmethod
+    def resolve_exit(cls, room, direction):
+        resolved = None
+        for o in room.contains:
+            if o.is_player_obj: continue
+
+            exits_map = o.get_data('exit')
+            if exits_map is None: continue
+
+            route = exits_map.get(room.shortname)
+            if route is None: continue
+
+            if route[0] == direction:
+                resolved = o
+                break
+
+        return resolved
+
+    @classmethod
     def all_active_objects(cls):
         """This method assumes that if an object is contained by something
         else, it's "active" in the game; in other words, we're assuming that a
@@ -236,16 +262,16 @@ class GameWorld:
            /get a banana
            /get Banana
         """
-        found = cls.resolve_obj(sender_obj.contained_by.contains,
-                                action_args, lambda o: o.is_player_obj)
+        found = cls.resolve_obj(sender_obj.neighbors, action_args, lambda o: o.is_player_obj)
 
         if found is None:
-            # TODO do not use exception
-            raise ClientException(OBJECT_NOT_FOUND.format(action_args))
+            raise UserError(OBJECT_NOT_FOUND.format(action_args))
 
         if not sender_obj.can_carry(found):
-            # TODO do not use exception
-            raise ClientException(OBJECT_DENIED.format(found.name))
+            raise UserError(OBJECT_DENIED.format(found.name))
+
+        if found.get_data('exit'):
+            raise UserError("You can't pick up an exit, only destroy it.")
 
         cls.put_into(sender_obj, found)
         cls.user_hears(sender_obj, sender_obj, 'You grab {}.'.format(found.name))
@@ -253,17 +279,14 @@ class GameWorld:
     @classmethod
     def handle_drop(cls, sender_obj, action_args):
         """Matches an object in sender_obj.contains and moves it to
-        sender_obj.contained_by"""
-
-        # TODO this doesn't seem to trigger a state update?
+        sender_obj's first contained by object."""
 
         found = cls.resolve_obj(sender_obj.contains, action_args)
 
         if found is None:
-            # TODO do not use exception
-            raise ClientException('You look in vain for something called {}.'.format(obj_string))
+            raise UserError(OBJECT_NOT_FOUND.format(action_args))
 
-        cls.put_into(sender_obj.contained_by, found)
+        cls.put_into(list(sender_obj.contained_by)[0], found)
         cls.user_hears(sender_obj, sender_obj, 'You drop {}.'.format(found.name))
 
     @classmethod
@@ -284,32 +307,28 @@ class GameWorld:
         """
         match = PUT_ARGS_RE.fullmatch(action_args)
         if match is None:
-            raise ClientException('Try /put some object in container object')
+            raise UserError('Try /put some object in container object')
         target_obj_str, container_obj_str = match.groups()
 
         target_obj = cls.resolve_obj(
-            itertools.chain(
-                sender_obj.contains,
-                sender_obj.contained_by.contains),
+            itertools.chain(sender_obj.contains, sender_obj.neighbors),
             target_obj_str, lambda o: o.is_player_obj)
 
         if target_obj is None:
-            raise ClientException(OBJECT_NOT_FOUND.format(target_obj_str))
+            raise UserError(OBJECT_NOT_FOUND.format(target_obj_str))
 
         if not sender_obj.can_carry(target_obj):
-            raise ClientException(OBJECT_DENIED.format(target_obj.name))
+            raise UserError(OBJECT_DENIED.format(target_obj.name))
 
         container_obj = cls.resolve_obj(
-            itertools.chain(
-                sender_obj.contains,
-                sender_obj.contained_by.contains),
+            itertools.chain(sender_obj.contains, sender_obj.neighbors),
             container_obj_str, lambda o: o.is_player_obj)
 
         if container_obj is None:
-            raise ClientException(OBJECT_NOT_FOUND.format(container_obj_str))
+            raise UserError(OBJECT_NOT_FOUND.format(container_obj_str))
 
         if not sender_obj.can_execute(container_obj):
-            raise ClientException(
+            raise UserError(
                 'You try as hard as you can, but you are unable to pry open {}'.format(
                     container_obj.name))
 
@@ -335,30 +354,28 @@ class GameWorld:
         """
         match = REMOVE_ARGS_RE.fullmatch(action_args)
         if match is None:
-            raise ClientException('Try /remove some object from container object')
+            raise UserError('Try /remove some object from container object')
         target_obj_str, container_obj_str = match.groups()
 
         container_obj = cls.resolve_obj(
-            itertools.chain(
-                sender_obj.contains,
-                sender_obj.contained_by.contains),
+            itertools.chain(sender_obj.contains, sender_obj.neighbors),
             container_obj_str, lambda o: o.is_player_obj)
 
         if container_obj is None:
-            raise ClientException(OBJECT_NOT_FOUND.format(container_obj_str))
+            raise UserError(OBJECT_NOT_FOUND.format(container_obj_str))
 
         if not sender_obj.can_execute(container_obj):
-            raise ClientException(
+            raise UserError(
                 'You try as hard as you can, but you are unable to pry open {}'.format(
                     container_obj))
 
         target_obj = cls.resolve_obj(container_obj.contains, target_obj_str)
 
         if target_obj is None:
-            raise ClientException(OBJECT_NOT_FOUND.format(target_obj_str))
+            raise UserError(OBJECT_NOT_FOUND.format(target_obj_str))
 
         if not sender_obj.can_carry(target_obj):
-            raise ClientException(OBJECT_DENIED.format(target_obj.name))
+            raise UserError(OBJECT_DENIED.format(target_obj.name))
 
         cls.put_into(sender_obj, target_obj)
         cls.user_hears(sender_obj, sender_obj, 'You remove {} from {} and carry it with you.'.format(
@@ -383,27 +400,21 @@ class GameWorld:
         obj = cls.resolve_obj(cls.area_of_effect(sender_obj), action_args)
 
         if obj is None:
-            cls.user_hears(sender_obj, sender_obj, '{{red}}You do not see an object called {}{{/}}'.format(action_args))
-            return
+            raise UserError(OBJECT_NOT_FOUND.format(action_args))
 
         # TODO if we're switching users to the WITCH tab when they run /edit,
         # they might miss these errors. they can always switch back to the main
         # tab though if nothing appears in the WITCH tab.
         if not sender_obj.can_write(obj):
-            cls.user_hears(sender_obj, sender_obj, '{{red}}You lack the authority to edit {}{{/}}'.format(obj.name))
-            return
+            raise UserError('You lack the authority to edit {}'.format(obj.name))
 
         if Editing.select().where(Editing.game_obj==obj).count() > 0:
-            cls.user_hears(sender_obj, sender_obj, '{red}That object is already being edited{/}')
-            return
+            raise UserError('That object is already being edited')
 
-        # TODO we still aren't cleanly handling disconnects. Part of the
-        # cleanup for a disconnect is clearing out any related entries in the
-        # Editing table. It should probably be cleared out on server start,
-        # too, now that I think about it.
+        # TODO Ensure that part of disconnecting is clearing out Editing table.
+        # It should also be cleared out on server start.
         with get_db().atomic():
             Editing.delete().where(Editing.user_account==sender_obj.user_account).execute()
-            Editing.delete().where(Editing.game_obj==obj).execute()
             Editing.create(
                 user_account=sender_obj.user_account,
                 game_obj=obj)
@@ -458,12 +469,11 @@ class GameWorld:
     def parse_create(cls, action_args):
         match = CREATE_RE.fullmatch(action_args)
         if match is None:
-            raise ClientException(
-                'malformed call to /create. the syntax is /create object-type "pretty name" [additional arguments]')
+            raise UserError('try /create object-type "pretty name" [additional arguments]')
 
         obj_type, name, additional_args = match.groups()
         if obj_type not in CREATE_TYPES:
-            raise ClientException(
+            raise UserError(
                 'Unknown type for /create. Try one of {}'.format(CREATE_TYPES))
 
         return obj_type, name, additional_args
@@ -500,6 +510,8 @@ class GameWorld:
             'name': name,
             'description': additional_args})
 
+        room.set_perm('carry', 'owner')
+
         sanctum = GameObject.get(
             GameObject.author==owner_obj.user_account,
             GameObject.is_sanctum==True)
@@ -509,75 +521,73 @@ class GameWorld:
 
         return room
 
+    # TODO audit error handling for non-user execution paths. UserErrors and
+    # ClientErrors initiating from a script engine and not the server core are
+    # going to crash the server.
+
     @classmethod
     def create_exit(cls, owner_obj, name, additional_args):
         # TODO consider having parse_create_exit that is called outside of this
+        # TODO currently the perms for adding exit to a room use write; should we use execute?
+        if not owner_obj.is_player_obj:
+            # TODO log
+            return
         match = CREATE_EXIT_ARGS_RE.fullmatch(additional_args)
         if not match:
-            raise ClientException('To make an exit, try /create exit "A Door" north foyer A rusted, metal door')
+            raise UserError('To make an exit, try /create exit "A Door" north god/foyer A rusted, metal door')
         direction, target_room_name, description = match.groups()
+        direction = cls.process_direction(direction)
         if direction not in DIRECTIONS:
-            raise ClientException('Try one of these directions: {}'.format(DIRECTIONS))
+            raise UserError('Try one of these directions: {}'.format(DIRECTIONS))
 
-        current_room = owner_obj.contained_by
+        current_room = owner_obj.room
         target_room = GameObject.get_or_none(
             GameObject.shortname == target_room_name)
 
         if target_room is None:
-            raise ClientException('Could not find a room with the ID {}'.format(target_room_name))
+            raise UserError('Could not find a room with the ID {}'.format(target_room_name))
 
         if not (owner_obj.user_account.is_god \
                 or current_room.author == owner_obj.user_account \
                 or owner_obj.can_write(current_room)):
-            raise ClientException('You lack the power to create an exit here.')
+            raise UserError('You lack the power to create an exit here.')
 
-        # make the here_exit
-        shortname = cls.derive_shortname(owner_obj, name)
-        here_exit = GameObject.create_scripted_object(
-            owner_obj.user_account, shortname, 'exit', {
-            'name': name,
-            'description': description,
-            'target_room_name': target_room.shortname})
+        # Check if exit for this dir already exists
+        current_exit = cls.resolve_exit(current_room, direction)
+        if current_exit:
+            raise UserError('An exit already exists in this room for that direction.')
 
-
+        # make the exit and add it to the creator's current room
         with get_db().atomic():
+            shortname = cls.derive_shortname(owner_obj, name)
+            new_exit = GameObject.create_scripted_object(
+                owner_obj.user_account, shortname, 'exit', {
+                'name': name,
+                'description': description})
+
+            new_exit.set_data('exit',
+                              {current_room.shortname: (direction, target_room.shortname),
+                               target_room.shortname: (REVERSE_DIRS[direction], current_room.shortname)})
             # exits inherit the write permission from the rooms they are
             # created in
             if current_room.perms.write == Permission.WORLD:
-                here_exit.set_perm('write', 'world')
-            exits = current_room.get_data('exits', {})
-            exits[direction] = here_exit.shortname
-            current_room.set_data('exits', exits)
-            cls.put_into(current_room, here_exit)
+                new_exit.set_perm('write', 'world')
+            new_exit.set_perm('carry', 'owner')
+            cls.put_into(current_room, new_exit)
 
-        # make the there_exit
+        # Expose the exit to the target room if able
         if owner_obj.user_account.is_god \
            or target_room.author == owner_obj.user_account \
            or owner_obj.can_write(target_room):
-            shortname = cls.derive_shortname(owner_obj, name, 'reverse')
-            there_exit = GameObject.create_scripted_object(
-                owner_obj.user_account, shortname, 'exit', {
-                'name': name,
-                'description': description,
-                'target_room_name': current_room.shortname})
-            rev_dir = REVERSE_DIRS[direction]
-            with get_db().atomic():
-                # exits inherit the write permission from the rooms they are
-                # created in
-                if target_room.perms.write == Permission.WORLD:
-                    there_exit.set_perm('write', 'world')
-                exits = target_room.get_data('exits', {})
-                exits[rev_dir] = there_exit.shortname
-                target_room.set_data('exits', exits)
-                cls.put_into(target_room, there_exit)
+            Contains.create(outer_obj=target_room, inner_obj=new_exit)
 
-        return here_exit
+        return new_exit
 
     @classmethod
     def create_portkey(cls, owner_obj, target, name=None):
         if name is None:
             name = 'Teleport Stone to {}'.format(target.name)
-        description = 'Touching this stone will transport you to'.format(target.name)
+        description = 'Touching this stone will transport you to {}'.format(target.name)
         shortname = cls.derive_shortname(owner_obj, name)
         return GameObject.create_scripted_object(
             owner_obj.user_account, shortname, 'portkey', {
@@ -586,9 +596,36 @@ class GameWorld:
             'target_room_name': target.shortname})
 
     @classmethod
+    def handle_mode(cls, sender_obj, action_args):
+        try:
+            obj_str, permission, value = split_args(action_args)
+        except ValueError:
+            raise UserError('try /mode object permission value')
+
+        target_obj = cls.resolve_obj(cls.area_of_effect(sender_obj), obj_str)
+        if target_obj is None:
+            raise UserError(OBJECT_NOT_FOUND.format(obj_str))
+
+        if not Permission.valid_perm(permission):
+            raise UserError('invalid permission. valid permissions are {}'.format(
+                ', '.join(Permission.PERMISSIONS)))
+
+        if not Permission.valid_value(value):
+            raise UserError('invalid value. valid values are {}'.format(
+                ', '.join(Permission.VALUES)))
+
+        if sender_obj.user_account != target_obj.author:
+            raise UserError("you lack the authority to mess with this object's permissions.")
+
+        target_obj.set_perm(permission, value)
+        cls.user_hears(sender_obj, sender_obj,
+                       'The world seems to gently vibrate around you. You have updated the {} permission to {}.'.format(
+                       permission, value))
+
+    @classmethod
     def handle_announce(cls, sender_obj, action_args):
         if not sender_obj.user_account.is_god:
-            raise ClientException('you are not powerful enough to do that.')
+            raise UserError('you are not powerful enough to do that.')
 
         aoe = cls.all_active_objects()
         for o in aoe:
@@ -598,15 +635,14 @@ class GameWorld:
     def handle_whisper(cls, sender_obj, action_args):
         action_args = action_args.split(' ')
         if 0 == len(action_args):
-            raise ClientException('try /whisper another_username some cool message')
+            raise UserError('try /whisper another_username some cool message')
         target_name = action_args[0]
         message = ' '.join(action_args[1:])
         if 0 == len(message):
-            raise ClientException('try /whisper another_username some cool message')
-        room = sender_obj.contained_by
-        target_obj = cls.resolve_obj(room.contains, target_name)
+            raise UserError('try /whisper another_username some cool message')
+        target_obj = cls.resolve_obj(sender_obj.neighbors, target_name)
         if target_obj is None:
-            raise ClientException('there is nothing named {} near you'.format(target_name))
+            raise UserError('there is nothing named {} near you'.format(target_name))
         target_obj.handle_action(cls, sender_obj, 'whisper', message)
 
     @classmethod
@@ -619,25 +655,26 @@ class GameWorld:
         # GameObject's state, but I think that dynamism can go into an /examine
         # command. /look is for getting a bearing on what's in front of you.
 
-        msgs = []
-        room = sender_obj.contained_by
-        room_desc = 'You are in the {}'.format(room.name)
-        if room.description:
-            room_desc += ', {}'.format(room.description)
-        msgs.append(room_desc)
+        if sender_obj.is_player_obj:
+            msgs = []
+            room = sender_obj.room
+            room_desc = 'You are in the {}'.format(room.name)
+            if room.description:
+                room_desc += ', {}'.format(room.description)
+            msgs.append(room_desc)
 
-        for o in room.contains:
-            if o.user_account:
-                o_desc = 'You see {}'.format(o.name)
-            else:
-                o_desc = 'You see a {}'.format(o.name)
+            for o in room.contains:
+                if o.user_account:
+                    o_desc = 'You see {}'.format(o.name)
+                else:
+                    o_desc = 'You see a {}'.format(o.name)
 
-            if o.description:
-                o_desc += ', {}'.format(o.description)
-            msgs.append(o_desc)
+                if o.description:
+                    o_desc += ', {}'.format(o.description)
+                msgs.append(o_desc)
 
-        for m in msgs:
-            cls.user_hears(sender_obj, sender_obj, m)
+            for m in msgs:
+                cls.user_hears(sender_obj, sender_obj, m)
 
         # finally, alert everything in the room that it's been looked at. game
         # objects can hook off of this if they want. By default, this does
@@ -647,61 +684,46 @@ class GameWorld:
             o.handle_action(cls, sender_obj, 'look', action_args)
 
     @classmethod
-    def handle_move(cls, sender_obj, action_args):
-        # We need to move sender_obj to whatever room is specified by the
-        # action_args string. Right now actions_args has to exactly match the
-        # shortname of a room in the database. In the future we might need
-        # fuzzy matching but for now I think moves are largely programmatic?
-        room = GameObject.get_or_none(GameObject.shortname==action_args)
-        if room:
-            if sender_obj == room:
-                cls.user_hears(sender_obj, sender_obj, "You can't move to yourself.")
-            else:
-                # TODO check room for execute permission
-                cls.put_into(room, sender_obj)
-                cls.user_hears(sender_obj, sender_obj, 'You materialize in a new place!')
-        else:
-            cls.user_hears(sender_obj, sender_obj, "Can't figure out what you meant to move to.")
+    def move_obj(cls, target_obj, target_room_name):
+        target_room = GameObject.get_or_none(GameObject.shortname==target_room_name)
+        if target_room is None:
+            raise UserError('illegal move') # should have been caught earlier
+        if target_obj.is_player_obj and target_obj == target_room:
+            raise UserError('You cannot move to yourself')
+
+        cls.put_into(target_room, target_obj)
+        if target_obj.is_player_obj:
+            cls.user_hears(target_obj, target_obj, 'You materialize in a new place!')
 
     @classmethod
     def handle_go(cls, sender_obj, action_args):
-        # Originally we discussed having exit items be found via their
-        # shortname; ie, north-a-door-vilmibm. I realized this is terrifying
-        # since any other user could create a drop a trap door named
-        # north-something. The resolution of the door would become undefined.
-        # Thus, while it pains me and I'm hoping for an alternative, I'm going
-        # to add some structure to rooms. Namely, their kv data is going to
-        # store a mapping of direction -> exit shortname. This data can only be
-        # changed (TODO: actually ensure this is true) by the author of the
-        # room.
-
-        # TODO in the future, consider allowing "non authoritative" directional
-        # exits. An exit obj exists in a room and has a direction and target
-        # stored on it. this is valid until the owner of the room overrides it
-        # with a blessed exit named in the room's exits hash.
-        #
-        # this is either redundant or additive if we also implement a "world
-        # writable" mode for stuff.
-
-        direction = action_args
-        current_room = sender_obj.contained_by
-        exits = current_room.get_data('exits', {})
-        if direction not in exits:
-            cls.user_hears(sender_obj, sender_obj, 'You cannot go that way.')
-            return
-
-        exit_obj_shortname = exits[direction]
-        exit_obj = None
-        for obj in current_room.contains:
-            if obj.shortname == exit_obj_shortname:
-                exit_obj = obj
-                break
-
+        direction = cls.process_direction(action_args)
+        current_room = sender_obj.room
+        exit_obj = cls.resolve_exit(sender_obj.room, direction)
         if exit_obj is None:
-            cls.user_hears(sender_obj, sender_obj, 'You cannot go that way.')
-            return
+            raise UserError('You cannot go that way.')
 
-        exit_obj.handle_action(cls, sender_obj, 'touch', '')
+        exit_obj.handle_action(cls, sender_obj, 'go', direction)
+
+    @classmethod
+    def process_direction(cls, input_direction):
+        """
+        Given a direction, checks through a list of aliases and returns the true
+        direction.
+        """
+
+        dir_map = {'north': {'north', 'n'},
+                   'south': {'south', 's'},
+                   'east': {'east', 'e'},
+                   'west': {'west', 'w'},
+                   'above': {'above', 'a', 'up', 'u'},
+                   'below': {'below', 'b', 'down', 'd'}}
+
+        for direction in dir_map:
+            if input_direction in dir_map.get(direction):
+                return direction
+
+        return input_direction
 
     @classmethod
     def area_of_effect(cls, sender_obj):
@@ -729,29 +751,40 @@ class GameWorld:
         this is easier to implement and also means you can "muffle" an object
         by stuffing it into a box.
         """
-        room = sender_obj.contained_by
         inventory = set(sender_obj.contains)
-        adjacent_objs = set(room.contains)
-        return {sender_obj, room} | inventory | adjacent_objs
+        parent_objs = set(sender_obj.contained_by)
+        adjacent_objs = set(sender_obj.neighbors)
+        return {sender_obj} | parent_objs | inventory | adjacent_objs
 
     @classmethod
     def put_into(cls, outer_obj, inner_obj):
         if outer_obj == inner_obj:
-            raise ClientException('Cannot put something into itself.')
-        if inner_obj.contained_by:
-            old_outer_obj = inner_obj.contained_by
+            raise UserError('Cannot put something into itself.')
+        # TODO for exits, i need to be able to put them into two rooms at once.
+        # Right now i'm thinking of just doing a raw Contains call when detecting
+        # an exit.
+
+        for old_outer_obj in inner_obj.contained_by:
             Contains.delete().where(Contains.inner_obj==inner_obj).execute()
+
+        Contains.create(outer_obj=outer_obj, inner_obj=inner_obj)
+
+        for old_outer_obj in inner_obj.contained_by:
             for o in old_outer_obj.contains:
                 if o.is_player_obj:
                     cls.send_client_update(o.user_account)
 
-        Contains.create(outer_obj=outer_obj, inner_obj=inner_obj)
+        for o in outer_obj.contains:
+            if o.is_player_obj:
+                cls.send_client_update(o.user_account)
 
         outer_obj.handle_action(cls, inner_obj, 'contain',  'acquired')
         inner_obj.handle_action(cls, outer_obj, 'contain',  'entered')
 
     @classmethod
     def remove_from(cls, outer_obj, inner_obj):
+        """This is only useful for player objects for when they disconnect;
+        otherwise all object moving is done via put_into."""
         Contains.delete().where(
             Contains.outer_obj==outer_obj,
             Contains.inner_obj==inner_obj).execute()
@@ -780,21 +813,30 @@ class GameWorld:
     def handle_revision(cls, owner_obj, shortname, code, current_rev):
         result = None
         with get_db().atomic():
-            # TODO this is going to create sadness; should be handled and user
-            # gently told
+            # TODO this is going to maybe create sadness; should be handled and
+            # user gently told
             obj = GameObject.get(GameObject.shortname==shortname)
             result = cls.object_state(obj)
+
+            # TODO this is probably bad, but for now we're assuming that
+            # REVISION implies a user edited a witch script and closed their
+            # editor, meaning they're done editing. In the future other things
+            # might use REVISION and this assumption might be bad; in that
+            # case, we can add another verb like UNLOCK.
+            Editing.delete().where(Editing.user_account==owner_obj.user_account).execute()
+
+            if obj.script_revision.code == code.lstrip().rstrip():
+                #  this was originally an error, but it felt weird.
+                return cls.object_state(obj)
 
             error = None
             if not (owner_obj.can_write(obj) or owner_obj.user_account == obj.author):
                 error = 'Tried to edit illegal object'
             elif obj.script_revision.id != current_rev:
                 error = 'Revision mismatch'
-            elif obj.script_revision.code == code.lstrip().rstrip():
-                error = 'No change to code'
 
             if error:
-                raise RevisionException(error, payload=result)
+                raise RevisionError(error, payload=result)
 
             rev = ScriptRevision.create(
                 code=code,
@@ -812,7 +854,7 @@ class GameWorld:
 
             try:
                 obj.init_scripting()
-            except WitchException as e:
+            except WitchError as e:
                 # TODO i don't actually have a good reason for errors being a
                 # list yet
                 witch_errors.append(str(e))
@@ -821,3 +863,7 @@ class GameWorld:
             result['errors'] = witch_errors
 
         return result
+
+    @classmethod
+    def handle_map(cls, player_obj):
+        return render_map(cls, player_obj.room, distance=2)

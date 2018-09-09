@@ -4,7 +4,8 @@ import os
 import hy
 
 from .config import get_db
-from .errors import ClientException, WitchException
+from .errors import ClientError, WitchError
+from .util import split_args
 
 WITCH_HEADER = '(require [tmserver.witch_header [*]])'
 
@@ -31,10 +32,8 @@ SCRIPT_TEMPLATES = {
     'exit': '''
     (witch "{name}"
       (has {{"name" "{name}"
-            "description" "{description}"
-            "target" "{target_room_name}"}})
-      (hears "touch"
-        (tell-sender "move" (get-data "target"))))
+            "description" "{description}"}})
+      (hears "go" (move-sender arg))),
     ''',
     'portkey': '''
     (witch "{name}"
@@ -42,7 +41,7 @@ SCRIPT_TEMPLATES = {
             "description" "{description}"
             "target" "{target_room_name}"}})
       (hears "touch"
-        (tell-sender "move" (get-data "target"))))
+        (teleport-sender (get-data "target"))))
     '''}
 
 class ScriptEngine:
@@ -68,7 +67,7 @@ class ScriptEngine:
     def _contain_handler(self, receiver, sender, action_args):
         contain_type = action_args
         if contain_type not in self.CONTAIN_TYPES:
-            raise ClientException('Bad container relation: {}'.format(contain_type))
+            raise ClientError('Bad container relation: {}'.format(contain_type))
         if receiver.user_account:
             self.game_world.send_client_update(receiver.user_account)
             # TODO we actually want the client to show messages about these
@@ -137,7 +136,7 @@ class ScriptedObjectMixin:
                     try:
                         self.script_revision = latest_rev
                         self.init_scripting()
-                    except WitchException as e:
+                    except WitchError as e:
                         self.script_revision = current_rev
                         # TODO log
                     else:
@@ -151,7 +150,7 @@ class ScriptedObjectMixin:
             try:
                 self._engine = self._execute_script(self.script_revision.code)
             except Exception as e:
-                raise WitchException(
+                raise WitchError(
                     ';_; There is a problem with your witch script: {}'.format(e))
 
     def handle_action(self, game_world, sender_obj, action, action_args):
@@ -180,6 +179,20 @@ class ScriptedObjectMixin:
 
     def tell_sender(self, sender_obj, action, args):
         self.game_world.dispatch_action(sender_obj, action, args)
+
+    def move_sender(self, sender_obj, direction):
+        current_room = sender_obj.room
+        route = self.get_data('exit', {}).get(current_room.shortname)
+        if route is None or route[0] != direction:
+            raise ClientError('illegal move') # this should have been caught higher up, so ok to throw
+
+        self.game_world.move_obj(sender_obj, route[1])
+
+    def teleport_sender(self, sender_obj, target_room_name):
+        self.game_world.move_obj(sender_obj, target_room_name)
+
+    def get_split_args(self, action_args):
+        return split_args(action_args)
 
     def _execute_script(self, witch_code):
         """Given a pile of script revision code, this function prepends the
